@@ -1511,46 +1511,68 @@ Choose a game:
 # ============================================
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("deposit", deposit))
-    app.add_handler(CommandHandler("withdraw", process_withdraw))
-    app.add_handler(CommandHandler("referral", referral))
-    app.add_handler(CommandHandler("history", history))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("broadcast", broadcast))
+    # Validate required environment variables
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not os.getenv("SUPABASE_URL"):
+        missing.append("SUPABASE_URL")
+    if not os.getenv("SUPABASE_KEY"):
+        missing.append("SUPABASE_KEY")
     
-    # Agent Commands
-    app.add_handler(CommandHandler("agent", agent_register))
-    app.add_handler(CommandHandler("buy_package", buy_package))
-    app.add_handler(CommandHandler("submit_tx", submit_tx))
-    app.add_handler(CommandHandler("agent_dashboard", agent_dashboard))
-    app.add_handler(CommandHandler("agent_team", agent_team))
-    app.add_handler(CommandHandler("agent_withdraw", agent_withdraw))
-    app.add_handler(CommandHandler("agent_stats", agent_stats))
-    app.add_handler(CommandHandler("agent_share", agent_share))
-    app.add_handler(CommandHandler("admin_agents", admin_agents))
-    app.add_handler(CommandHandler("approve_agent", admin_approve_agent))
-    app.add_handler(CommandHandler("reject_agent", admin_reject_agent))
-    app.add_handler(CommandHandler("approve_withdraw", admin_approve_withdraw))
+    if missing:
+        logger.error(f"Missing required environment variables: {', '.join(missing)}")
+        print(f"ERROR: Missing environment variables: {', '.join(missing)}")
+        print("Set them in Railway → Variables tab")
+        return
     
-    # Game Control Commands (Admin)
-    app.add_handler(CommandHandler("games", admin_game_panel))
-    app.add_handler(CommandHandler("promo", create_promo))
+    logger.info(f"Starting bot with ADMIN_ID={ADMIN_ID}")
     
-    # User Commands
-    app.add_handler(CommandHandler("claim", claim_promo))
-    app.add_handler(CommandHandler("limits", set_limits_menu))
-    app.add_handler(CommandHandler("exclude", self_exclude))
+    try:
+        app = Application.builder().token(BOT_TOKEN).build()
 
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(callback_handler))
+        # Commands
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("balance", balance))
+        app.add_handler(CommandHandler("deposit", deposit))
+        app.add_handler(CommandHandler("withdraw", process_withdraw))
+        app.add_handler(CommandHandler("referral", referral))
+        app.add_handler(CommandHandler("history", history))
+        app.add_handler(CommandHandler("admin", admin_panel))
+        app.add_handler(CommandHandler("broadcast", broadcast))
+        
+        # Agent Commands
+        app.add_handler(CommandHandler("agent", agent_register))
+        app.add_handler(CommandHandler("buy_package", buy_package))
+        app.add_handler(CommandHandler("submit_tx", submit_tx))
+        app.add_handler(CommandHandler("agent_dashboard", agent_dashboard))
+        app.add_handler(CommandHandler("agent_team", agent_team))
+        app.add_handler(CommandHandler("agent_withdraw", agent_withdraw))
+        app.add_handler(CommandHandler("agent_stats", agent_stats))
+        app.add_handler(CommandHandler("agent_share", agent_share))
+        app.add_handler(CommandHandler("admin_agents", admin_agents))
+        app.add_handler(CommandHandler("approve_agent", admin_approve_agent))
+        app.add_handler(CommandHandler("reject_agent", admin_reject_agent))
+        app.add_handler(CommandHandler("approve_withdraw", admin_approve_withdraw))
+        
+        # Game Control Commands (Admin)
+        app.add_handler(CommandHandler("games", admin_game_panel))
+        app.add_handler(CommandHandler("promo", create_promo))
+        
+        # User Commands
+        app.add_handler(CommandHandler("claim", claim_promo))
+        app.add_handler(CommandHandler("limits", set_limits_menu))
+        app.add_handler(CommandHandler("exclude", self_exclude))
 
-    print("🎰 BetVortex Casino Bot is running!")
-    app.run_polling()
+        # Callbacks
+        app.add_handler(CallbackQueryHandler(callback_handler))
+
+        print("🎰 BetVortex Casino Bot is running!")
+        app.run_polling()
+    except Exception as e:
+        logger.error(f"Bot startup failed: {e}", exc_info=True)
+        print(f"ERROR: Bot startup failed: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
