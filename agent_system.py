@@ -13,10 +13,11 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import ContextTypes
-from supabase import create_client, Client
 import os
+import logging
+from db import supabase
 
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), ***"SUPABASE_KEY"))
+logger = logging.getLogger(__name__)
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # ============================================
@@ -156,121 +157,148 @@ CREATE TABLE agent_purchases (
 # ============================================
 
 def get_agent(telegram_id: int):
-    result = supabase.table("agents").select("*").eq("telegram_id", telegram_id).execute()
-    return result.data[0] if result.data else None
+    try:
+        result = supabase.table("agents").select("*").eq("telegram_id", telegram_id).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.error(f"get_agent({telegram_id}) failed: {e}")
+        return None
 
 def get_agent_by_code(agent_code: str):
-    result = supabase.table("agents").select("*").eq("agent_code", agent_code).execute()
-    return result.data[0] if result.data else None
+    try:
+        result = supabase.table("agents").select("*").eq("agent_code", agent_code).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.error(f"get_agent_by_code({agent_code}) failed: {e}")
+        return None
 
 def register_agent(telegram_id: int, username: str, parent_code: str = None):
     """Register agent (not paid yet)"""
-    existing = get_agent(telegram_id)
-    if existing:
-        return existing
-    
-    agent_code = "AGT" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    
-    parent_id = None
-    if parent_code:
-        parent = get_agent_by_code(parent_code)
-        if parent:
-            parent_id = parent["telegram_id"]
-    
-    data = {
-        "telegram_id": telegram_id,
-        "username": username,
-        "agent_code": agent_code,
-        "parent_agent_id": parent_id,
-        "is_active": False,
-        "is_paid": False,
-    }
-    
-    supabase.table("agents").insert(data).execute()
-    return data
+    try:
+        existing = get_agent(telegram_id)
+        if existing:
+            return existing
+        
+        agent_code = "AGT" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        
+        parent_id = None
+        if parent_code:
+            parent = get_agent_by_code(parent_code)
+            if parent:
+                parent_id = parent["telegram_id"]
+        
+        data = {
+            "telegram_id": telegram_id,
+            "username": username,
+            "agent_code": agent_code,
+            "parent_agent_id": parent_id,
+            "is_active": False,
+            "is_paid": False,
+        }
+        
+        supabase.table("agents").insert(data).execute()
+        return data
+    except Exception as e:
+        logger.error(f"register_agent({telegram_id}) failed: {e}")
+        return None
 
 def activate_agent(telegram_id: int, package: str, payment_method: str, tx_hash: str = None):
     """Activate agent after payment"""
-    pkg = AGENT_PACKAGES[package]
-    
-    supabase.table("agents").update({
-        "package": package,
-        "package_price": pkg["price"],
-        "commission_rate": pkg["commission"],
-        "is_active": True,
-        "is_paid": True,
-        "payment_method": payment_method,
-        "payment_tx_hash": tx_hash,
-        "activated_at": datetime.utcnow().isoformat()
-    }).eq("telegram_id", telegram_id).execute()
-    
-    # Log purchase
-    supabase.table("agent_purchases").insert({
-        "agent_id": telegram_id,
-        "package": package,
-        "amount": pkg["price"],
-        "payment_method": payment_method,
-        "tx_hash": tx_hash,
-        "status": "completed"
-    }).execute()
+    try:
+        pkg = AGENT_PACKAGES[package]
+        
+        supabase.table("agents").update({
+            "package": package,
+            "package_price": pkg["price"],
+            "commission_rate": pkg["commission"],
+            "is_active": True,
+            "is_paid": True,
+            "payment_method": payment_method,
+            "payment_tx_hash": tx_hash,
+            "activated_at": datetime.utcnow().isoformat()
+        }).eq("telegram_id", telegram_id).execute()
+        
+        # Log purchase
+        supabase.table("agent_purchases").insert({
+            "agent_id": telegram_id,
+            "package": package,
+            "amount": pkg["price"],
+            "payment_method": payment_method,
+            "tx_hash": tx_hash,
+            "status": "completed"
+        }).execute()
+    except Exception as e:
+        logger.error(f"activate_agent({telegram_id}, {package}) failed: {e}")
 
 def get_agent_referrals(agent_id: int):
-    result = supabase.table("users").select("*").eq("referred_by", agent_id).execute()
-    return result.data if result.data else []
+    try:
+        result = supabase.table("users").select("*").eq("referred_by", agent_id).execute()
+        return result.data if result.data else []
+    except Exception as e:
+        logger.error(f"get_agent_referrals({agent_id}) failed: {e}")
+        return []
 
 def get_sub_agents(parent_id: int):
-    result = supabase.table("agents").select("*").eq("parent_agent_id", parent_id).execute()
-    return result.data if result.data else []
+    try:
+        result = supabase.table("agents").select("*").eq("parent_agent_id", parent_id).execute()
+        return result.data if result.data else []
+    except Exception as e:
+        logger.error(f"get_sub_agents({parent_id}) failed: {e}")
+        return []
 
 def calculate_commission(agent_id: int, bet_amount: float, game: str, house_profit: float):
     """Calculate commission on house profit (not bet amount)"""
-    agent = get_agent(agent_id)
-    if not agent or not agent["is_active"]:
-        return 0
-    
-    commission = house_profit * float(agent["commission_rate"])
-    
-    if commission <= 0:
-        return 0
-    
-    supabase.table("agent_commissions").insert({
-        "agent_id": agent_id,
-        "bet_amount": bet_amount,
-        "commission_amount": commission,
-        "commission_type": "direct",
-        "game": game
-    }).execute()
-    
-    new_total = float(agent["total_commission"]) + commission
-    new_wagered = float(agent["total_wagered_by_refs"]) + bet_amount
-    supabase.table("agents").update({
-        "total_commission": new_total,
-        "total_wagered_by_refs": new_wagered
-    }).eq("telegram_id", agent_id).execute()
-    
-    # Override commission for parent agent
-    if agent.get("parent_agent_id"):
-        parent = get_agent(agent["parent_agent_id"])
-        if parent and parent["is_active"]:
-            override_rate = float(parent["commission_rate"]) * 0.2  # 20% of their rate as override
-            override = house_profit * override_rate
-            
-            if override > 0:
-                supabase.table("agent_commissions").insert({
-                    "agent_id": parent["telegram_id"],
-                    "from_user_id": agent_id,
-                    "bet_amount": bet_amount,
-                    "commission_amount": override,
-                    "commission_type": "override",
-                    "game": game
-                }).execute()
+    try:
+        agent = get_agent(agent_id)
+        if not agent or not agent["is_active"]:
+            return 0
+        
+        commission = house_profit * float(agent["commission_rate"])
+        
+        if commission <= 0:
+            return 0
+        
+        supabase.table("agent_commissions").insert({
+            "agent_id": agent_id,
+            "bet_amount": bet_amount,
+            "commission_amount": commission,
+            "commission_type": "direct",
+            "game": game
+        }).execute()
+        
+        new_total = float(agent["total_commission"]) + commission
+        new_wagered = float(agent["total_wagered_by_refs"]) + bet_amount
+        supabase.table("agents").update({
+            "total_commission": new_total,
+            "total_wagered_by_refs": new_wagered
+        }).eq("telegram_id", agent_id).execute()
+        
+        # Override commission for parent agent
+        if agent.get("parent_agent_id"):
+            parent = get_agent(agent["parent_agent_id"])
+            if parent and parent["is_active"]:
+                override_rate = float(parent["commission_rate"]) * 0.2  # 20% of their rate as override
+                override = house_profit * override_rate
                 
-                supabase.table("agents").update({
-                    "total_earned_override": float(parent["total_earned_override"]) + override,
-                    "total_commission": float(parent["total_commission"]) + override
-                }).eq("telegram_id", parent["telegram_id"]).execute()
-    
-    return commission
+                if override > 0:
+                    supabase.table("agent_commissions").insert({
+                        "agent_id": parent["telegram_id"],
+                        "from_user_id": agent_id,
+                        "bet_amount": bet_amount,
+                        "commission_amount": override,
+                        "commission_type": "override",
+                        "game": game
+                    }).execute()
+                    
+                    supabase.table("agents").update({
+                        "total_earned_override": float(parent["total_earned_override"]) + override,
+                        "total_commission": float(parent["total_commission"]) + override
+                    }).eq("telegram_id", parent["telegram_id"]).execute()
+        
+        return commission
+    except Exception as e:
+        logger.error(f"calculate_commission({agent_id}, {bet_amount}, {game}) failed: {e}")
+        return 0
 
 # ============================================
 # AGENT COMMANDS
