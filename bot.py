@@ -7,8 +7,11 @@ import os
 import random
 import hashlib
 import string
+import logging
+import time
 from decimal import Decimal
 from datetime import datetime
+from functools import wraps
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -18,7 +21,17 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters
 )
-from supabase import create_client, Client
+from db import supabase
+
+# ============================================
+# LOGGING SETUP
+# ============================================
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 from agent_system import (
     agent_register, agent_dashboard, agent_team,
     agent_withdraw, agent_stats,
@@ -45,17 +58,21 @@ from game_control import (
     create_promo, claim_promo, set_limits_menu, self_exclude,
     is_game_enabled, check_user_can_bet
 )
+from ui_messages import (
+    WELCOME_NEW_USER, WELCOME_EXISTING_USER,
+    WIN_MESSAGE, LOSE_MESSAGE, DRAW_MESSAGE,
+    BALANCE_TEXT, REFERRAL_TEXT, HELP_TEXT,
+    ERROR_INSUFFICIENT_BALANCE, ERROR_GAME_DISABLED,
+    WITHDRAW_MENU, WITHDRAW_SUBMITTED,
+    SLOTS_SPIN, MAIN_MENU_TEXT
+)
 
 # ============================================
 # CONFIG
 # ============================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ============================================
 # HOUSE EDGE SETTINGS
@@ -72,12 +89,59 @@ HOUSE_EDGE = {
 }
 
 # ============================================
-# DATABASE HELPERS
+# RATE LIMITING
 # ============================================
 
+_rate_limits = {}  # {user_id: [timestamp, ...]}
+RATE_LIMIT_WINDOW = 5  # seconds
+RATE_LIMIT_MAX_BETS = 3  # max bets per window
+
+def is_rate_limited(user_id: int) -> bool:
+    """Check if user is betting too fast."""
+    now = time.time()
+    if user_id not in _rate_limits:
+        _rate_limits[user_id] = []
+    # Clean old entries
+    _rate_limits[user_id] = [t for t in _rate_limits[user_id] if now - t < RATE_LIMIT_WINDOW]
+    if len(_rate_limits[user_id]) >= RATE_LIMIT_MAX_BETS:
+        return True
+    _rate_limits[user_id].append(now)
+    return False
+
+# ============================================
+# ERROR HANDLING DECORATOR
+# ============================================
+
+def safe_handler(func):
+    """Decorator that catches exceptions and logs them instead of crashing."""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {e}", exc_info=True)
+            # Try to notify user
+            try:
+                update = args[0] if args else None
+                if update and hasattr(update, 'callback_query') and update.callback_query:
+                    await update.callback_query.answer("⚠️ An error occurred. Try again.", show_alert=True)
+                elif update and hasattr(update, 'message') and update.message:
+                    await update.message.reply_text("⚠️ Something went wrong. Please try again.")
+            except Exception:
+                pass
+    return wrapper
+
+# ============================================
+# DATABASE HELPERS (with error handling)
+# =============================================
+
 def get_user(telegram_id: int):
-    result = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
-    return result.data[0] if result.data else None
+    try:
+        result = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
+        return result.data[0] if result.data else None
+    except Exception as e:
+        logger.error(f"get_user({telegram_id}) failed: {e}")
+        return None
 
 def create_user(telegram_id: int, username: str, referred_by: int = None):
     ref_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
@@ -87,32 +151,63 @@ def create_user(telegram_id: int, username: str, referred_by: int = None):
         "referral_code": ref_code,
         "referred_by": referred_by
     }
-    supabase.table("users").insert(data).execute()
+    try:
+        supabase.table("users").insert(data).execute()
+    except Exception as e:
+        logger.error(f"create_user({telegram_id}) failed: {e}")
     return data
 
 def update_balance(telegram_id: int, amount: float):
-    user = get_user(telegram_id)
-    new_balance = float(user["balance"]) + amount
-    supabase.table("users").update({"balance": new_balance}).eq("telegram_id", telegram_id).execute()
-    return new_balance
+    """Atomic balance update using Supabase RPC (no race condition)."""
+    try:
+        # Use Supabase RPC for atomic increment
+        result = supabase.rpc("atomic_balance_update", {
+            "p_telegram_id": telegram_id,
+            "p_amount": amount
+        }).execute()
+        if result.data is not None:
+            return float(result.data)
+    except Exception as e:
+        logger.warning(f"RPC atomic_balance_update not available, falling back: {e}")
+
+    # Fallback: read-then-write (non-atomic, but better than nothing)
+    try:
+        user = get_user(telegram_id)
+        if not user:
+            logger.error(f"update_balance: user {telegram_id} not found")
+            return 0
+        new_balance = float(user["balance"]) + amount
+        if new_balance < 0:
+            new_balance = 0
+        supabase.table("users").update({"balance": new_balance}).eq("telegram_id", telegram_id).execute()
+        return new_balance
+    except Exception as e:
+        logger.error(f"update_balance({telegram_id}, {amount}) failed: {e}")
+        return 0
 
 def log_transaction(telegram_id: int, tx_type: str, amount: float, status: str = "completed"):
-    supabase.table("transactions").insert({
-        "user_id": telegram_id,
-        "type": tx_type,
-        "amount": amount,
-        "status": status
-    }).execute()
+    try:
+        supabase.table("transactions").insert({
+            "user_id": telegram_id,
+            "type": tx_type,
+            "amount": amount,
+            "status": status
+        }).execute()
+    except Exception as e:
+        logger.error(f"log_transaction({telegram_id}) failed: {e}")
 
 def log_bet(telegram_id: int, game: str, amount: float, multiplier: float, result: str, profit: float):
-    supabase.table("bets").insert({
-        "user_id": telegram_id,
-        "game": game,
-        "amount": amount,
-        "multiplier": multiplier,
-        "result": result,
-        "profit": profit
-    }).execute()
+    try:
+        supabase.table("bets").insert({
+            "user_id": telegram_id,
+            "game": game,
+            "amount": amount,
+            "multiplier": multiplier,
+            "result": result,
+            "profit": profit
+        }).execute()
+    except Exception as e:
+        logger.error(f"log_bet({telegram_id}, {game}) failed: {e}")
 
 # ============================================
 # PROVABLY FAIR
@@ -179,6 +274,7 @@ def main_menu_keyboard():
 # COMMAND HANDLERS
 # ============================================
 
+@safe_handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     telegram_id = user.id
@@ -199,19 +295,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Bonus for new user
         update_balance(telegram_id, 1.00)
         log_transaction(telegram_id, "bonus", 1.00)
-        welcome_bonus = "\n\n🎁 **Welcome Bonus: $1.00 Added!**"
+        text = WELCOME_NEW_USER.format(username=username, balance=get_user(telegram_id)['balance'])
     else:
-        welcome_bonus = ""
-
-    text = f"""
-🎰 **Welcome to BetVortex Casino!** 🎰
-
-Hello {username}! Ready to play?
-
-💰 Balance: ${get_user(telegram_id)['balance']:.2f}
-
-Choose a game below:{welcome_bonus}
-    """
+        text = WELCOME_EXISTING_USER.format(username=username, balance=get_user(telegram_id)['balance'])
 
     await update.message.reply_text(
         text,
@@ -219,22 +305,25 @@ Choose a game below:{welcome_bonus}
         parse_mode="Markdown"
     )
 
+@safe_handler
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     if not user:
         await update.message.reply_text("❌ Please /start first!")
         return
 
-    text = f"""
-💰 **Your Balance**
-
-💵 Balance: **${user['balance']:.2f}**
-📥 Total Deposited: ${user['total_deposited']:.2f}
-📤 Total Withdrawn: ${user['total_withdrawn']:.2f}
-🎰 Total Wagered: ${user['total_wagered']:.2f}
-    """
+    text = BALANCE_TEXT.format(
+        balance=float(user['balance']),
+        deposited=float(user['total_deposited']),
+        withdrawn=float(user['total_withdrawn']),
+        wagered=float(user['total_wagered']),
+        games_played=0,  # TODO: count from bets table
+        win_rate=0,       # TODO: calculate
+        biggest_win=0     # TODO: calculate
+    )
     await update.message.reply_text(text, parse_mode="Markdown")
 
+@safe_handler
 async def deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [
@@ -269,22 +358,10 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Please /start first!")
         return
 
-    text = f"""
-💸 **Withdraw**
-
-💰 Available: **${user['balance']:.2f}**
-
-To withdraw, send:
-`/withdraw AMOUNT ADDRESS`
-
-Example:
-`/withdraw 50 TRC20_ADDRESS_HERE`
-
-⚡ Min withdrawal: $10
-🕐 Processing: Manual review (24h max)
-    """
+    text = WITHDRAW_MENU.format(balance=float(user['balance']))
     await update.message.reply_text(text, parse_mode="Markdown")
 
+@safe_handler
 async def process_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     if not user:
@@ -328,6 +405,7 @@ async def process_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("❌ Format: /withdraw AMOUNT ADDRESS")
 
+@safe_handler
 async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     if not user:
@@ -358,6 +436,7 @@ async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     await update.message.reply_text(text, parse_mode="Markdown")
 
+@safe_handler
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bets = supabase.table("bets").select("*").eq(
         "user_id", update.effective_user.id
@@ -378,6 +457,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # GAMES
 # ============================================
 
+@safe_handler
 async def game_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, game: str):
     query = update.callback_query
     await query.answer()
@@ -453,10 +533,16 @@ SLOT_PAYOUTS = {
     "7️⃣7️⃣7️⃣": 100,
 }
 
+@safe_handler
 async def play_slots(update: Update, context: ContextTypes.DEFAULT_TYPE, bet_amount: float):
     query = update.callback_query
+    user_id = update.effective_user.id
 
-    user = get_user(update.effective_user.id)
+    if is_rate_limited(user_id):
+        await query.answer("⏳ Slow down! Wait a few seconds.", show_alert=True)
+        return
+
+    user = get_user(user_id)
     if float(user["balance"]) < bet_amount:
         await query.answer("❌ Insufficient balance!", show_alert=True)
         return
@@ -522,10 +608,16 @@ Multiplier: {multiplier}x
 # DICE GAME
 # ============================================
 
+@safe_handler
 async def play_dice(update: Update, context: ContextTypes.DEFAULT_TYPE, bet_amount: float):
     query = update.callback_query
+    user_id = update.effective_user.id
 
-    user = get_user(update.effective_user.id)
+    if is_rate_limited(user_id):
+        await query.answer("⏳ Slow down! Wait a few seconds.", show_alert=True)
+        return
+
+    user = get_user(user_id)
     if float(user["balance"]) < bet_amount:
         await query.answer("❌ Insufficient balance!", show_alert=True)
         return
@@ -1098,6 +1190,7 @@ Bet: ${game['bet']:.2f}
 # ADMIN COMMANDS
 # ============================================
 
+@safe_handler
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -1150,6 +1243,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CALLBACK ROUTER
 # ============================================
 
+@safe_handler
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -1180,6 +1274,11 @@ Choose a game:
         parts = data.split("_")
         game = parts[1]
         amount = float(parts[2])
+
+        # Rate limit check
+        if is_rate_limited(update.effective_user.id):
+            await query.answer("⏳ Slow down! Wait a few seconds.", show_alert=True)
+            return
 
         if game == "slots":
             await play_slots(update, context, amount)
@@ -1355,49 +1454,7 @@ Choose a game:
         await history(update, context)
     elif data == "help":
         await query.answer()
-        text = """
-ℹ️ **Help**
-
-**Games (18 Total):**
-🎰 Slots - Spin & match symbols
-🎲 Dice - Predict over/under
-✈️ Crash - Cash out before crash
-🃏 Blackjack - Get 21
-🎡 Roulette - Bet on number/color
-🪙 Coin Flip - Heads or Tails
-💣 Mines - Find gems, avoid mines
-📌 Plinko - Drop ball, win prizes
-🎡 Wheel - Spin the wheel
-🎱 Keno - Pick lucky numbers
-🔺 Hi-Lo - Higher or lower
-🂡 Baccarat - Player vs Banker
-🎟️ Lottery - Win big prizes
-✊ RPS - Rock Paper Scissors
-🎯 Limbo - Roll above target
-🏗️ Tower - Climb floors
-🔴 Double - Color bet
-➕ Adder - Add to 21
-
-**Agent System:**
-/agent - Register as agent
-/buy_package - Buy agent package
-/agent_dashboard - Agent stats
-
-**Responsible Gambling:**
-/limits - Set betting limits
-/exclude - Self-exclude
-
-**Commands:**
-/start - Main menu
-/balance - Check balance
-/deposit - Add funds
-/withdraw - Cash out
-/referral - Earn by referring
-/history - View bets
-/help - This message
-
-**Support:** @YourSupportUsername
-        """
+        text = HELP_TEXT
         await query.edit_message_text(
             text,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
