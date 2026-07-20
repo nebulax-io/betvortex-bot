@@ -4,12 +4,13 @@ Admin can control all game settings, limits, house edge, enable/disable games
 """
 
 import os
+import logging
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from supabase import create_client, Client
+from db import supabase
 
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), ***"SUPABASE_KEY"))
+logger = logging.getLogger(__name__)
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # ============================================
@@ -86,34 +87,43 @@ CREATE TABLE user_limits (
 
 def get_game_settings(game: str = None):
     """Get settings for one or all games"""
-    if game:
-        result = supabase.table("game_settings").select("*").eq("game", game).execute()
-        if result.data:
-            return result.data[0]
-        return DEFAULT_SETTINGS.get(game, DEFAULT_SETTINGS["slots"])
-    else:
-        result = supabase.table("game_settings").select("*").execute()
-        settings = {}
-        for row in (result.data or []):
-            settings[row["game"]] = row
-        # Fill defaults for missing
-        for game_id, default in DEFAULT_SETTINGS.items():
-            if game_id not in settings:
-                settings[game_id] = default
-        return settings
+    try:
+        if game:
+            result = supabase.table("game_settings").select("*").eq("game", game).execute()
+            if result.data:
+                return result.data[0]
+            return DEFAULT_SETTINGS.get(game, DEFAULT_SETTINGS["slots"])
+        else:
+            result = supabase.table("game_settings").select("*").execute()
+            settings = {}
+            for row in (result.data or []):
+                settings[row["game"]] = row
+            # Fill defaults for missing
+            for game_id, default in DEFAULT_SETTINGS.items():
+                if game_id not in settings:
+                    settings[game_id] = default
+            return settings
+    except Exception as e:
+        logger.error(f"get_game_settings({game}) failed: {e}")
+        if game:
+            return DEFAULT_SETTINGS.get(game, DEFAULT_SETTINGS["slots"])
+        return DEFAULT_SETTINGS
 
 def update_game_setting(game: str, **kwargs):
     """Update a game setting"""
-    kwargs["updated_at"] = datetime.utcnow().isoformat()
-    kwargs["updated_by"] = ADMIN_ID
-    
-    existing = supabase.table("game_settings").select("*").eq("game", game).execute()
-    
-    if existing.data:
-        supabase.table("game_settings").update(kwargs).eq("game", game).execute()
-    else:
-        kwargs["game"] = game
-        supabase.table("game_settings").insert(kwargs).execute()
+    try:
+        kwargs["updated_at"] = datetime.utcnow().isoformat()
+        kwargs["updated_by"] = ADMIN_ID
+        
+        existing = supabase.table("game_settings").select("*").eq("game", game).execute()
+        
+        if existing.data:
+            supabase.table("game_settings").update(kwargs).eq("game", game).execute()
+        else:
+            kwargs["game"] = game
+            supabase.table("game_settings").insert(kwargs).execute()
+    except Exception as e:
+        logger.error(f"update_game_setting({game}) failed: {e}")
 
 def is_game_enabled(game: str) -> bool:
     """Check if a game is enabled"""
@@ -136,61 +146,71 @@ def get_house_edge(game: str) -> float:
 
 def get_user_limits(user_id: int):
     """Get user's responsible gambling limits"""
-    result = supabase.table("user_limits").select("*").eq("user_id", user_id).execute()
-    if result.data:
-        return result.data[0]
-    return None
+    try:
+        result = supabase.table("user_limits").select("*").eq("user_id", user_id).execute()
+        if result.data:
+            return result.data[0]
+        return None
+    except Exception as e:
+        logger.error(f"get_user_limits({user_id}) failed: {e}")
+        return None
 
 def set_user_limits(user_id: int, **kwargs):
     """Set user limits"""
-    kwargs["updated_at"] = datetime.utcnow().isoformat()
-    existing = get_user_limits(user_id)
-    
-    if existing:
-        supabase.table("user_limits").update(kwargs).eq("user_id", user_id).execute()
-    else:
-        kwargs["user_id"] = user_id
-        supabase.table("user_limits").insert(kwargs).execute()
+    try:
+        kwargs["updated_at"] = datetime.utcnow().isoformat()
+        existing = get_user_limits(user_id)
+        
+        if existing:
+            supabase.table("user_limits").update(kwargs).eq("user_id", user_id).execute()
+        else:
+            kwargs["user_id"] = user_id
+            supabase.table("user_limits").insert(kwargs).execute()
+    except Exception as e:
+        logger.error(f"set_user_limits({user_id}) failed: {e}")
 
 def check_user_can_bet(user_id: int, amount: float, game: str) -> tuple:
     """Check if user is allowed to bet"""
-    limits = get_user_limits(user_id)
-    
-    if not limits:
+    try:
+        limits = get_user_limits(user_id)
+        
+        if not limits:
+            return (True, "OK")
+        
+        if limits.get("self_excluded"):
+            if limits.get("exclude_until"):
+                until = limits["exclude_until"]
+                if datetime.fromisoformat(until) > datetime.utcnow():
+                    return (False, f"⛔ Self-excluded until {until[:10]}")
+            else:
+                return (False, "⛔ Self-excluded permanently")
+        
+        if limits.get("daily_loss_limit"):
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            result = supabase.table("bets").select("profit").eq(
+                "user_id", user_id
+            ).gte("created_at", today).execute()
+            
+            total_loss = sum(abs(float(b["profit"])) for b in (result.data or []) if float(b["profit"]) < 0)
+            
+            if total_loss + amount > limits["daily_loss_limit"]:
+                return (False, f"⛔ Daily loss limit reached (${limits['daily_loss_limit']:.2f})")
+        
+        if limits.get("daily_bet_limit"):
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            result = supabase.table("bets").select("amount").eq(
+                "user_id", user_id
+            ).gte("created_at", today).execute()
+            
+            total_bet = sum(float(b["amount"]) for b in (result.data or []))
+            
+            if total_bet + amount > limits["daily_bet_limit"]:
+                return (False, f"⛔ Daily bet limit reached (${limits['daily_bet_limit']:.2f})")
+        
         return (True, "OK")
-    
-    if limits.get("self_excluded"):
-        if limits.get("exclude_until"):
-            until = limits["exclude_until"]
-            if datetime.fromisoformat(until) > datetime.utcnow():
-                return (False, f"⛔ Self-excluded until {until[:10]}")
-        else:
-            return (False, "⛔ Self-excluded permanently")
-    
-    if limits.get("daily_loss_limit"):
-        # Check daily losses
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        result = supabase.table("bets").select("profit").eq(
-            "user_id", user_id
-        ).gte("created_at", today).execute()
-        
-        total_loss = sum(abs(float(b["profit"])) for b in (result.data or []) if float(b["profit"]) < 0)
-        
-        if total_loss + amount > limits["daily_loss_limit"]:
-            return (False, f"⛔ Daily loss limit reached (${limits['daily_loss_limit']:.2f})")
-    
-    if limits.get("daily_bet_limit"):
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        result = supabase.table("bets").select("amount").eq(
-            "user_id", user_id
-        ).gte("created_at", today).execute()
-        
-        total_bet = sum(float(b["amount"]) for b in (result.data or []))
-        
-        if total_bet + amount > limits["daily_bet_limit"]:
-            return (False, f"⛔ Daily bet limit reached (${limits['daily_bet_limit']:.2f})")
-    
-    return (True, "OK")
+    except Exception as e:
+        logger.error(f"check_user_can_bet({user_id}) failed: {e}")
+        return (True, "OK")  # Allow bet if check fails
 
 # ============================================
 # ADMIN COMMANDS
