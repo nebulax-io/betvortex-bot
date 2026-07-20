@@ -1,6 +1,6 @@
 """
 BetVortex — Shared Database Module
-Single Supabase client instance for the entire bot.
+Lazy initialization — connects on first use, not at import time.
 """
 
 import os
@@ -9,12 +9,23 @@ from supabase import create_client, Client
 
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+_supabase_client = None
 
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("✅ Supabase client initialized")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize Supabase: {e}")
-    raise
+def get_client() -> Client:
+    """Get or create Supabase client (lazy init)."""
+    global _supabase_client
+    if _supabase_client is None:
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+        if not url or not key:
+            raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables are required")
+        _supabase_client = create_client(url, key)
+        logger.info("Supabase client initialized")
+    return _supabase_client
+
+class _SupabaseProxy:
+    """Proxy that lazy-inits Supabase client on first table() call."""
+    def __getattr__(self, name):
+        return getattr(get_client(), name)
+
+supabase = _SupabaseProxy()
