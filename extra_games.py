@@ -6,6 +6,7 @@ Mines, Plinko, Wheel, Keno, Hi-Lo, Baccarat, Lottery, Rock Paper Scissors
 import random
 import string
 import math
+import logging
 from decimal import Decimal
 from datetime import datetime
 
@@ -13,32 +14,48 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import ContextTypes
-from supabase import create_client, Client
 import os
+from db import supabase
 
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), ***"SUPABASE_KEY"))
+logger = logging.getLogger(__name__)
 
 SLOT_SYMBOLS = ["🍒", "🍋", "🍊", "🍇", "🔔", "💎", "⭐", "7️⃣"]
 
 def get_user(tid):
-    r = supabase.table("users").select("*").eq("telegram_id", tid).execute()
-    return r.data[0] if r.data else None
+    try:
+        r = supabase.table("users").select("*").eq("telegram_id", tid).execute()
+        return r.data[0] if r.data else None
+    except Exception as e:
+        logger.error(f"get_user({tid}) failed: {e}")
+        return None
 
 def update_balance(tid, amount):
-    u = get_user(tid)
-    nb = float(u["balance"]) + amount
-    supabase.table("users").update({"balance": nb}).eq("telegram_id", tid).execute()
-    return nb
+    try:
+        u = get_user(tid)
+        if not u:
+            return 0
+        nb = float(u["balance"]) + amount
+        if nb < 0:
+            nb = 0
+        supabase.table("users").update({"balance": nb}).eq("telegram_id", tid).execute()
+        return nb
+    except Exception as e:
+        logger.error(f"update_balance({tid}, {amount}) failed: {e}")
+        return 0
 
 def log_bet(tid, game, amount, mult, result, profit):
-    supabase.table("bets").insert({
-        "user_id": tid, "game": game, "amount": amount,
-        "multiplier": mult, "result": result, "profit": profit
-    }).execute()
-    u = get_user(tid)
-    supabase.table("users").update({
-        "total_wagered": float(u["total_wagered"]) + amount
-    }).eq("telegram_id", tid).execute()
+    try:
+        supabase.table("bets").insert({
+            "user_id": tid, "game": game, "amount": amount,
+            "multiplier": mult, "result": result, "profit": profit
+        }).execute()
+        u = get_user(tid)
+        if u:
+            supabase.table("users").update({
+                "total_wagered": float(u["total_wagered"]) + amount
+            }).eq("telegram_id", tid).execute()
+    except Exception as e:
+        logger.error(f"log_bet({tid}, {game}) failed: {e}")
 
 # ============================================
 # GAME 7: MINES 💣
